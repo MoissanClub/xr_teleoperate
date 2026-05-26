@@ -20,17 +20,19 @@ kTopicbraincoRightState = "rt/brainco/right/state"
 
 class Brainco_Controller:
     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
-                       dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
+                       dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False, use_hand_tracking = True):
         logger_mp.info("Initialize Brainco_Controller...")
         self.fps = fps
         self.hand_sub_ready = False
         self.Unit_Test = Unit_Test
+        self.use_hand_tracking = use_hand_tracking
         self.simulation_mode = simulation_mode
 
-        if not self.Unit_Test:
-            self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND)
-        else:
-            self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND_Unit_Test)
+        if self.use_hand_tracking:
+            if not self.Unit_Test:
+                self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND)
+            else:
+                self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND_Unit_Test)
 
 
         # initialize handcmd publisher and handstate subscriber
@@ -115,16 +117,21 @@ class Brainco_Controller:
         try:
             while self.running:
                 start_time = time.time()
-                # get dual hand state
-                with left_hand_array.get_lock():
-                    left_hand_data  = np.array(left_hand_array[:]).reshape(25, 3).copy()
-                with right_hand_array.get_lock():
-                    right_hand_data = np.array(right_hand_array[:]).reshape(25, 3).copy()
-
                 # Read left and right q_state from shared arrays
                 state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
 
-                if not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
+                if self.use_hand_tracking:
+                    with left_hand_array.get_lock():
+                        left_hand_data  = np.array(left_hand_array[:]).reshape(25, 3).copy()
+                    with right_hand_array.get_lock():
+                        right_hand_data = np.array(right_hand_array[:]).reshape(25, 3).copy()
+                else:
+                    with left_hand_array.get_lock():
+                        left_q_target = np.clip(np.array(left_hand_array[:]), 0.0, 1.0)
+                    with right_hand_array.get_lock():
+                        right_q_target = np.clip(np.array(right_hand_array[:]), 0.0, 1.0)
+
+                if self.use_hand_tracking and not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
                     ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
                     ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
 

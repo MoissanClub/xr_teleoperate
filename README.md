@@ -462,6 +462,15 @@ Please refer to the [Repo README](https://github.com/unitreerobotics/dex1_1_serv
 >    - right joystick = turning; 
 >    - max speed is limited in the code.
 
+For a BrainCo hand in controller tracking mode, each trigger directly controls closure of its corresponding hand: released is open and fully pulled is a fist. Optional held-button poses use normalized BrainCo positions in motor order `[thumb, thumb_aux, index, middle, ring, pinky]`, where `0.0` is open and `1.0` is closed:
+
+```bash
+python teleop_hand_and_arm.py --input-mode=controller --ee=brainco \
+  --brainco-controller-config=brainco_controller_poses.example.json
+```
+
+The JSON configuration is keyed by unused button fields: `left_ctrl_squeeze`, `right_ctrl_squeeze`, `left_ctrl_aButton` (physical X), `left_ctrl_bButton` (physical Y), and `right_ctrl_bButton` (physical B). Each pose supplies `left`, `right`, or both as six-element normalized position lists. While the button is held its configured side overrides that side's trigger; if simultaneously held poses set the same side, the later JSON entry wins. See [`teleop/brainco_controller_poses.example.json`](teleop/brainco_controller_poses.example.json).
+
 Same as simulation but follow the safety warnings above.
 
 ## 3.6 🔚 Exit

@@ -1,5 +1,6 @@
 import time
 import argparse
+import json
 from multiprocessing import Value, Array, Lock
 import threading
 import logging_mp
@@ -29,6 +30,49 @@ def publish_reset_category(category: int, publisher): # Scene Reset signal
     msg = String_(data=str(category))
     publisher.Write(msg)
     logger_mp.info(f"published reset category: {category}")
+
+BRAINCO_CONTROLLER_POSE_BUTTONS = (
+    "left_ctrl_squeeze",
+    "right_ctrl_squeeze",
+    "left_ctrl_aButton",
+    "left_ctrl_bButton",
+    "right_ctrl_bButton",
+)
+
+def load_brainco_controller_poses(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as config_file:
+        raw_poses = json.load(config_file)
+    if not isinstance(raw_poses, dict):
+        raise ValueError("configuration must be a JSON object keyed by controller button")
+
+    poses = {}
+    for button, raw_pose in raw_poses.items():
+        if button not in BRAINCO_CONTROLLER_POSE_BUTTONS:
+            raise ValueError(f"unsupported button '{button}'; valid buttons: {', '.join(BRAINCO_CONTROLLER_POSE_BUTTONS)}")
+        if not isinstance(raw_pose, dict) or not raw_pose or set(raw_pose) - {"left", "right"}:
+            raise ValueError(f"pose for '{button}' must contain 'left' and/or 'right' only")
+
+        pose = {}
+        for side, values in raw_pose.items():
+            if not isinstance(values, list) or len(values) != 6:
+                raise ValueError(f"'{button}.{side}' must be a six-element list")
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0.0 or value > 1.0 for value in values):
+                raise ValueError(f"'{button}.{side}' values must be numbers in [0.0, 1.0]")
+            pose[side] = values
+        poses[button] = pose
+    return poses
+
+def brainco_controller_targets(tele_data, poses: dict) -> tuple:
+    # TeleVuer triggerValue is 10 when released and 0 when fully pulled.
+    left_close = min(max(1.0 - tele_data.left_ctrl_triggerValue / 10.0, 0.0), 1.0)
+    right_close = min(max(1.0 - tele_data.right_ctrl_triggerValue / 10.0, 0.0), 1.0)
+    left_target = [left_close] * 6
+    right_target = [right_close] * 6
+    for button, pose in poses.items():
+        if getattr(tele_data, button):
+            left_target = pose.get("left", left_target)
+            right_target = pose.get("right", right_target)
+    return left_target, right_target
 
 # state transition
 START          = False  # Enable to start robot following VR user motion
@@ -78,6 +122,7 @@ if __name__ == '__main__':
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='G1_29', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
+    parser.add_argument('--brainco-controller-config', type=str, help='JSON mappings from unused controller buttons to BrainCo hand poses')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
@@ -95,6 +140,14 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    brainco_controller_poses = {}
+    if args.brainco_controller_config:
+        if args.ee != "brainco" or args.input_mode != "controller":
+            parser.error("--brainco-controller-config requires --ee=brainco --input-mode=controller")
+        try:
+            brainco_controller_poses = load_brainco_controller_poses(args.brainco_controller_config)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            parser.error(f"invalid --brainco-controller-config: {error}")
     logger_mp.debug(f"args: {args}")
 
     try:
@@ -198,13 +251,15 @@ if __name__ == '__main__':
             hand_ctrl = Inspire_Controller_FTP(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
         elif args.ee == "brainco":
             from teleop.robot_control.robot_hand_brainco import Brainco_Controller
-            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
-            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
+            brainco_input_size = 75 if args.input_mode == "hand" else 6
+            left_hand_pos_array = Array('d', brainco_input_size, lock = True)  # [input] hand landmarks or controller motor targets
+            right_hand_pos_array = Array('d', brainco_input_size, lock = True) # [input] hand landmarks or controller motor targets
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
             dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
             hand_ctrl = Brainco_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
-                                           dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
+                                           dual_hand_state_array, dual_hand_action_array, use_hand_tracking=args.input_mode == "hand",
+                                           simulation_mode=args.sim)
         else:
             pass
         
@@ -308,6 +363,12 @@ if __name__ == '__main__':
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
                 with right_gripper_value.get_lock():
                     right_gripper_value.value = tele_data.right_ctrl_triggerValue
+            elif args.ee == "brainco" and args.input_mode == "controller":
+                left_target, right_target = brainco_controller_targets(tele_data, brainco_controller_poses)
+                with left_hand_pos_array.get_lock():
+                    left_hand_pos_array[:] = left_target
+                with right_hand_pos_array.get_lock():
+                    right_hand_pos_array[:] = right_target
             elif args.ee == "dex1" and args.input_mode == "hand":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_hand_pinchValue
@@ -371,7 +432,7 @@ if __name__ == '__main__':
                         current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
                                                -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
                                                -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
-                elif (args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
+                elif ((args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand") or (args.ee == "brainco" and args.input_mode == "controller"):
                     with dual_hand_data_lock:
                         left_ee_state = dual_hand_state_array[:6]
                         right_ee_state = dual_hand_state_array[-6:]
