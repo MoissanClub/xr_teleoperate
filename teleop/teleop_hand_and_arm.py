@@ -402,13 +402,11 @@ if __name__ == '__main__':
 
                 # high level control
                 if args.input_mode == "controller" and args.motion:
-                    # quit teleoperate
-                    if tele_data.right_ctrl_aButton:
-                        START = False
-                        STOP = True
+                    # quit is already handled by poll_quest_controller_buttons()/on_press('q')
+                    # above (edge-detected); don't duplicate it here with a level-triggered check.
                     # command robot to enter damping mode. soft emergency stop function
                     if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
-                        loco_wrapper.Damp()
+                        loco_wrapper.Enter_Damp_Mode()
                     # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
                     loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
                                       -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
@@ -584,13 +582,16 @@ if __name__ == '__main__':
                 break
 
             # START was toggled off (right B / 'r' pressed again) rather than STOP: this is a
-            # pause back to Ready, not a quit. Send the arm home, same as on quit, then loop
-            # back to the top of the outer while for the wait loop again.
-            logger_mp.info("⏸️  Returning to Ready state...")
-            try:
-                arm_ctrl.ctrl_dual_arm_go_home()
-            except Exception as e:
-                logger_mp.error(f"Failed to ctrl_dual_arm_go_home on pause: {e}")
+            # pause back to Ready, not a quit. Unlike quit's `finally:` teardown, do NOT call
+            # ctrl_dual_arm_go_home() here: it blocks for several seconds (convergence wait,
+            # plus a weight ramp when motion_mode is on) and poll_quest_controller_buttons()
+            # is never called during that window, so a right-B press that lands mid-call is
+            # silently dropped -- this was the actual pause/resume regression. Just stop
+            # feeding new IK targets instead: arm_ctrl's background publish thread keeps
+            # republishing the last q_target/tauff_target at 250Hz on its own, so the arm
+            # safely freezes in place with no extra code needed. Then loop back to the top of
+            # the outer while for the wait loop again.
+            logger_mp.info("⏸️  Paused: arm frozen in place. Press right B / [r] again to resume.")
 
     except KeyboardInterrupt:
         logger_mp.info("⛔ KeyboardInterrupt, exiting program...")
