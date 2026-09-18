@@ -1,5 +1,9 @@
 # 🔖 Release Note
 
+## 🏷️ Unreleased (fork)
+
+- Added `--record-audio`: records the G1 microphone (PC1 UDP multicast stream) into each episode's `audios/` folder as per-frame `.npy` files plus an `audio.wav`.
+
 ## 🏷️ v1.6 (2026.7.29)
 
 - Added support for the **H2** robot.

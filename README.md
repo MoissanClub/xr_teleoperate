@@ -238,6 +238,7 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |   `--sim`    | **Enable [simulation mode](https://github.com/unitreerobotics/unitree_sim_isaaclab)** |
 |   `--ipc`    | **Inter-process communication mode** Allows controlling the xr_teleoperate program’s state via IPC. Suitable for interaction with agent programs. |
 |  `--record`  | **Enable data recording mode** Press **r** to start teleoperation, then **s** to start recording; press **s** again to stop and save the episode. Press **s** repeatedly to repeat the process. Quest 3 controller buttons can do the same — see 1.4. |
+| `--record-audio` | **Also record the G1 microphone** (requires `--record`; not available with `--sim`). See Note 4 below. |
 | `--task-dir` | Path to save recorded data. Default: `./utils/data/` |
 | `--task-name` | Task file name for recording. Default: `pick cube` |
 | `--task-goal` | Task goal recorded in the json file. Default: `pick up cube.` |
@@ -389,6 +390,8 @@ Next steps:
 > **Note 2**: Please pay attention to your disk space size during data recording.
 >
 > **Note 3**: In v1.4 and above, the “record image” window has been removed.
+>
+> **Note 4 (audio, `--record-audio`)**: The G1 microphone array is attached to PC1 and published on the wired robot network as UDP multicast `239.168.123.161:5555` (16 kHz, 16-bit, mono PCM), so the machine running this program must be on the `192.168.123.0/24` network. Each episode's `audios/` folder then contains `audio_{idx:06d}_mic_0.npy` (an `int16` array per frame, referenced from `data.json`) and `audio.wav` (the same audio concatenated, in sync with the video). Each frame owns the audio between its own timestamp and the next frame's, so chunk lengths vary slightly. Audio is written when the episode is saved. The program exits at startup if no microphone stream arrives within 5 s, and warns if the stream is all zeros (seen when the robot's Voice Assistant is in "Closed mode"). Audio may be offset from the video by up to ~160 ms (packet size); `AUDIO_LATENCY_S` in `teleop/utils/audio_recorder.py` compensates once calibrated.
 
 ## 2.3 🔚 Exit
 

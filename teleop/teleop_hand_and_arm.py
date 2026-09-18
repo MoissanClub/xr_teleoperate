@@ -19,6 +19,7 @@ from teleop.robot_control.robot_arm import G1_29_ArmController, G1_29_Arm_Intern
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK, R1_A5_ArmIK, R1_A7_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
+from teleop.utils.audio_recorder import G1MicRecorder
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
@@ -181,6 +182,7 @@ if __name__ == '__main__':
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
+    parser.add_argument('--record-audio', action = 'store_true', help = 'Also record the G1 microphone (streamed by PC1 over UDP multicast) into each episode\'s audios/ folder. Requires --record; not available with --sim')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
@@ -192,6 +194,13 @@ if __name__ == '__main__':
 
     if args.ee == "dex1_internal" and args.motion:
         parser.error("--ee dex1_internal does not currently support --motion.")
+    if args.record_audio and not args.record:
+        parser.error("--record-audio requires --record.")
+    if args.record_audio and args.sim:
+        parser.error("--record-audio is not available with --sim (there is no G1 microphone in simulation).")
+
+    recorder = None        # set up later; the `finally:` teardown must tolerate an early failure
+    audio_recorder = None
 
     try:
         # setup dds communication domains id
@@ -363,12 +372,18 @@ if __name__ == '__main__':
                                    "here and would otherwise stall the recorder on every frame). "
                                    "Pass --headless to silence this warning.")
             rerun_log = not args.headless and has_display
+            if args.record_audio:
+                # Fails fast (RuntimeError -> the `finally:` teardown below) if PC1's microphone
+                # stream is not reachable, rather than silently recording episodes without audio.
+                audio_recorder = G1MicRecorder()
+                audio_recorder.start()
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
                                      task_steps = args.task_steps,
                                      frequency = args.frequency,
-                                     rerun_log = rerun_log)
+                                     rerun_log = rerun_log,
+                                     audio_recorder = audio_recorder)
 
         while not STOP:
             logger_mp.info("----------------------------------------------------------------")
@@ -706,9 +721,16 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to stop sim state subscriber: {e}")
         
         try:
-            if args.record:
+            if args.record and recorder is not None:
                 recorder.close()
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
+
+        # After recorder.close(): saving the last episode still needs the audio receiver.
+        try:
+            if audio_recorder is not None:
+                audio_recorder.stop()
+        except Exception as e:
+            logger_mp.error(f"Failed to stop audio recorder: {e}")
         logger_mp.info("✅ Finally, exiting program.")
         exit(0)

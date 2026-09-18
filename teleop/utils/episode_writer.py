@@ -5,15 +5,18 @@ import datetime
 import numpy as np
 import time
 from .rerun_visualizer import RerunLogger
+from .audio_recorder import MIC_NAME
 from queue import Queue, Empty
 from threading import Thread
 import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
 class EpisodeWriter():
-    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True):
+    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True, audio_recorder = None):
         """
         image_size: [width, height]
+        audio_recorder: optional started G1MicRecorder. When given, every episode also gets
+            audios/audio_{idx}_mic_0.npy per frame plus audios/audio.wav (written at save time).
         """
         logger_mp.info("==> EpisodeWriter initializing...\n")
         self.task_dir = task_dir
@@ -31,6 +34,10 @@ class EpisodeWriter():
 
         self.frequency = frequency
         self.image_size = image_size
+
+        self.audio_recorder = audio_recorder
+        self.frame_times = []           # time.monotonic() of every add_item() in this episode
+        self.audio_frames_written = 0   # frames whose data.json entry (and audio path) exists
 
         self.rerun_log = rerun_log
         if self.rerun_log:
@@ -119,6 +126,11 @@ class EpisodeWriter():
             f.write('"data": [\n')
         self.first_item = True   # Flag to handle commas in JSON array
 
+        if self.audio_recorder is not None:
+            self.frame_times = []
+            self.audio_frames_written = 0
+            self.audio_recorder.begin_episode()
+
         if self.rerun_log:
             self.online_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit="300MB")
 
@@ -129,6 +141,11 @@ class EpisodeWriter():
     def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
         # Increment the item ID
         self.item_id += 1
+        if self.audio_recorder is not None:
+            # Audio is cut by wall-clock at save time (G1MicRecorder.finish_episode), so here we
+            # only stamp the frame time and pre-assign the per-frame file path recorded in data.json.
+            self.frame_times.append(time.monotonic())
+            audios = {MIC_NAME: os.path.join('audios', f'audio_{str(self.item_id).zfill(6)}_{MIC_NAME}.npy')}
         # Create the item data dictionary
         item_data = {
             'idx': self.item_id,
@@ -183,7 +200,10 @@ class EpisodeWriter():
                 item_data['depths'][depth_key] = os.path.join('depths', depth_name)
 
         # Save audios
-        if audios:
+        if self.audio_recorder is not None:
+            # Paths were pre-assigned in add_item; the files are written in _save_episode.
+            self.audio_frames_written += 1
+        elif audios:
             for mic, audio in audios.items():
                 audio_name = f'audio_{str(idx).zfill(6)}_{mic}.npy'
                 np.save(os.path.join(self.audio_dir, audio_name), audio.astype(np.int16))
@@ -214,6 +234,15 @@ class EpisodeWriter():
         """
         Save the episode data to a JSON file.
         """
+        if self.audio_recorder is not None:
+            # Only frames that made it into data.json get audio files, so the two always agree.
+            # Never let an audio failure block closing the JSON / re-arming the writer below.
+            try:
+                self.audio_recorder.finish_episode(self.frame_times[:self.audio_frames_written],
+                                                   self.frequency, self.audio_dir)
+            except Exception as e:
+                logger_mp.error(f"Failed to write episode audio: {e}")
+
         with open(self.json_path, "a", encoding="utf-8") as f:
             f.write("\n]\n}")      # Close the JSON array and object
 
