@@ -196,10 +196,11 @@ class EpisodeWriter():
             f.write(json.dumps(item_data, ensure_ascii=False, indent=4))
             self.first_item = False
 
-        # Log data if necessary
+        # Progress log: independent of rerun_log, so it keeps showing while an episode is
+        # recording/draining even when live Rerun visualization is disabled (e.g. no display).
+        logger_mp.info(f"==> episode_id:{self.episode_id}  item_id:{idx}  current_time:{time.time()}")
+
         if self.rerun_log:
-            curent_record_time = time.time()
-            logger_mp.info(f"==> episode_id:{self.episode_id}  item_id:{idx}  current_time:{curent_record_time}")
             self.rerun_logger.log_item_data(item_data)
 
     def save_episode(self):

@@ -1,6 +1,7 @@
 import time
 import argparse
 from multiprocessing import Value, Array, Lock
+from queue import Queue, Empty
 import threading
 import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
@@ -35,7 +36,15 @@ START          = False  # Enable to start robot following VR user motion
 STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
-RECORD_TOGGLE  = False  # Toggle recording state
+# Queue of pending record-toggle requests (one entry per accepted 's' press / Quest left-X
+# edge), drained by the main loop. A plain bool here can't distinguish "one toggle" from "two
+# toggles that happened to land in the same loop iteration" -- it just silently nets out to no
+# change, which is how a real second 's' press can appear to do nothing. Written from the
+# sshkeyboard listener thread, the IPC thread, and poll_quest_controller_buttons() on the main
+# thread; Queue is thread-safe so no extra lock is needed.
+RECORD_TOGGLE_QUEUE = Queue()
+_RECORD_TOGGLE_DEBOUNCE_S = 0.3  # ignore repeat 's' edges (key auto-repeat, duplicate button events) within this window
+_last_record_toggle_time = 0.0
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -50,24 +59,40 @@ RECORD_TOGGLE  = False  # Toggle recording state
 #
 #  'r' is itself a toggle between [Ready] and the tracking loop (the diagram above only
 #  covers the sub-states reachable once tracking has started):
-#   not START            ==> 'r' ==> START=True                (enter tracking)
-#   START, not recording ==> 'r' ==> START=False                (return to [Ready]; arm goes home)
-#   START, recording     ==> 'r' ==> ignored, warns             (stop/save the recording first)
+#   not START            ==> 'r' ==> START=True                          (enter tracking)
+#   START, not recording ==> 'r' ==> START=False                          (pause; arm freezes in place)
+#   START, recording     ==> 'r' ==> stop/save the recording, then START=False (pause; arm freezes in place)
+#                                     -- same "stop and save" as pressing 'q' while recording,
+#                                     just pausing instead of quitting afterwards.
+
+def _queue_record_toggle():
+    """Enqueue one record start/stop request, debounced against repeat edges. Shared by the
+    's' key/Quest left-X path and the 'r'-while-recording path below (both are, semantically,
+    "stop the recording now")."""
+    global _last_record_toggle_time
+    now = time.time()
+    if now - _last_record_toggle_time < _RECORD_TOGGLE_DEBOUNCE_S:
+        logger_mp.info(f"[on_press] record toggle requested again within {_RECORD_TOGGLE_DEBOUNCE_S}s of the last one; ignoring as a repeat.")
+        return
+    _last_record_toggle_time = now
+    RECORD_TOGGLE_QUEUE.put(now)
+    logger_mp.info("[on_press] queued a record start/stop toggle.")
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE
+    global STOP, START
     if key == 'r':
         if not START:
             START = True
-        elif RECORD_RUNNING:
-            logger_mp.warning("[on_press] r pressed while recording is running; stop/save the recording before returning to Ready.")
         else:
+            if RECORD_RUNNING:
+                logger_mp.info("[on_press] r pressed while recording is running; stopping/saving the recording, then pausing.")
+                _queue_record_toggle()
             START = False
     elif key == 'q':
         START = False
         STOP = True
     elif key == 's' and START == True:
-        RECORD_TOGGLE = True
+        _queue_record_toggle()
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -78,7 +103,7 @@ def on_press(key):
 # controller buttons while hand-tracking is active.
 # Mapping: right A = quit, right B = start/ready toggle, left X = record toggle (left Y reserved).
 # Only ever read/written from the main thread (wait loop + main loop), unlike the keyboard-
-# listener/IPC-server threads that mutate START/STOP/RECORD_TOGGLE, so no lock is needed here.
+# listener/IPC-server threads that mutate START/STOP/RECORD_TOGGLE_QUEUE, so no lock is needed here.
 _QUEST_PREV_BUTTONS = {"quit": False, "start": False, "record": False}
 
 def poll_quest_controller_buttons(tele_data):
@@ -109,6 +134,34 @@ def get_state() -> dict:
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
     }
+
+def drain_record_toggle_queue():
+    """Apply every queued record-toggle request as its own start/stop transition. Called every
+    tracking-loop iteration, and once more right after the loop exits (pause or quit): a toggle
+    can be enqueued (by on_press's r-while-recording path, which pauses and requests a stop in
+    the same call) after the loop's last full iteration already passed this point, and without
+    this extra call it would sit stranded in the queue until the next resume -- i.e. recording
+    would look paused but keep running until 'r' is pressed again."""
+    global RECORD_RUNNING
+    while True:
+        try:
+            RECORD_TOGGLE_QUEUE.get_nowait()
+        except Empty:
+            break
+        if not RECORD_RUNNING:
+            if recorder.create_episode():
+                RECORD_RUNNING = True
+                logger_mp.info("[record] toggle consumed: not recording -> RECORDING")
+            else:
+                logger_mp.error("Failed to create episode. Recording not started.")
+        else:
+            RECORD_RUNNING = False
+            pending = recorder.item_data_queue.qsize()
+            recorder.save_episode()
+            logger_mp.info(f"[record] toggle consumed: RECORDING -> saving ({pending} frames still queued; "
+                           f"a new episode can't start until they're written -- watch for 'Episode saved successfully' below)")
+            if args.sim:
+                publish_reset_category(1, reset_pose_publisher)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -294,12 +347,28 @@ if __name__ == '__main__':
 
         # record + headless / non-headless mode
         if args.record:
+            # RerunLogger.__init__ calls rr.spawn(), which launches a native GUI viewer and
+            # then streams every recorded frame to it over TCP. With no DISPLAY/WAYLAND_DISPLAY
+            # (the common case for a robot-control PC driven over SSH), that viewer can never
+            # start, so every rr.log() call in the recorder's background worker thread retries/
+            # times out against a socket nobody is listening on. That doesn't crash anything,
+            # but it silently slows the worker down to a few items/sec, so the item queue backs
+            # up during any real recording and takes a long time to drain after "stop" -- which
+            # looks exactly like the recording never stopped. Auto-disable it when there's
+            # provably no display to show it on, same as --headless already does explicitly.
+            has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+            if not args.headless and not has_display:
+                logger_mp.warning("No DISPLAY/WAYLAND_DISPLAY detected; disabling Rerun live "
+                                   "visualization for this recording (it can't spawn a viewer "
+                                   "here and would otherwise stall the recorder on every frame). "
+                                   "Pass --headless to silence this warning.")
+            rerun_log = not args.headless and has_display
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
                                      task_steps = args.task_steps,
-                                     frequency = args.frequency, 
-                                     rerun_log = not args.headless)
+                                     frequency = args.frequency,
+                                     rerun_log = rerun_log)
 
         while not STOP:
             logger_mp.info("----------------------------------------------------------------")
@@ -348,19 +417,11 @@ if __name__ == '__main__':
                     if args.record:
                         right_wrist_img = img_client.get_right_wrist_frame()
 
-                # record mode
-                if args.record and RECORD_TOGGLE:
-                    RECORD_TOGGLE = False
-                    if not RECORD_RUNNING:
-                        if recorder.create_episode():
-                            RECORD_RUNNING = True
-                        else:
-                            logger_mp.error("Failed to create episode. Recording not started.")
-                    else:
-                        RECORD_RUNNING = False
-                        recorder.save_episode()
-                        if args.sim:
-                            publish_reset_category(1, reset_pose_publisher)
+                # record mode: drain every queued toggle request, one start/stop transition
+                # each, so two real requests landing in the same iteration can never cancel
+                # each other out (see RECORD_TOGGLE_QUEUE comment above).
+                if args.record:
+                    drain_record_toggle_queue()
 
                 # get xr's tele data
                 tele_data = tv_wrapper.get_tele_data()
@@ -591,6 +652,12 @@ if __name__ == '__main__':
             # republishing the last q_target/tauff_target at 250Hz on its own, so the arm
             # safely freezes in place with no extra code needed. Then loop back to the top of
             # the outer while for the wait loop again.
+            # One more drain here: on_press's r-while-recording path enqueues a stop request in
+            # the same call that sets START=False, so it can land after the loop body already
+            # passed this iteration's drain_record_toggle_queue() call above -- without this,
+            # that stop would sit in the queue, unapplied, until the next resume.
+            if args.record:
+                drain_record_toggle_queue()
             logger_mp.info("⏸️  Paused: arm frozen in place. Press right B / [r] again to resume.")
 
     except KeyboardInterrupt:
